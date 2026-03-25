@@ -1,32 +1,33 @@
 model:
-  name: "llava-hf/llava-1.5-7b-hf"   # any HF multimodal LM
+  name: "llava-hf/llava-1.5-7b-hf"
   device: "cuda"
-  dtype: "float16"                     # "float16" | "float32" | "bfloat16"
+  dtype: "float16"
 
 extraction:
-  pooling: "last"                      # "last" (last token) | "mean" (all tokens)
-  batch_size: 8
-  layers: null                         # null = all layers; or list e.g. [15,16,17,18]
+  pooling: "last"           # "last" (last token) | "mean" (all tokens)
+  batch_size: 4             # LLaVA-1.5-7b needs ~14GB VRAM; reduce if OOM
+  layers: null              # null = all 33 layers (0=embed, 1-32=transformer)
 
 data:
   pku_saferlhf:
-    path: "data/pku_saferlhf"          # local dir or HF dataset id
-    n_samples: 500                     # per class (safe / harmful)
+    path: "data/pku_saferlhf"
+    n_samples: 500          # per class
     text_col: "prompt"
     response_col: "response_0"
     label_col: "is_response_0_safe"
   visual_harm:
-    path: "data/visual_harm"           # local dir with images + labels.csv
+    path: "data/visual_harm"
     n_samples: 200
     image_col: "image_path"
-    label_col: "label"                 # 0=safe 1=harmful
-    prompt_template: "Describe what you see in this image."
+    label_col: "label"      # 0=safe, 1=harmful
+    # question shown to the model alongside each image
+    prompt_template: "What is shown in this image?"
 
 analysis:
-  n_pls_components: 5
-  n_safety_layers: 5                   # top-k layers by linear-probe accuracy
-  boundary_threshold: 0.35            # |logit| < threshold → boundary sample
+  n_safety_layers: 5        # top-k layers by linear probe accuracy
+  n_pls_components: 5       # PLS components (first component = safety direction)
+  boundary_threshold: 0.35  # |score| < threshold → boundary sample
 
 output:
   dir: "outputs"
-  save_states: true                    # cache .npy arrays to disk
+  save_states: true         # cache hidden states as .npy for --skip-extract
