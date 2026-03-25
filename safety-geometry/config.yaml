@@ -1,0 +1,32 @@
+model:
+  name: "llava-hf/llava-1.5-7b-hf"   # any HF multimodal LM
+  device: "cuda"
+  dtype: "float16"                     # "float16" | "float32" | "bfloat16"
+
+extraction:
+  pooling: "last"                      # "last" (last token) | "mean" (all tokens)
+  batch_size: 8
+  layers: null                         # null = all layers; or list e.g. [15,16,17,18]
+
+data:
+  pku_saferlhf:
+    path: "data/pku_saferlhf"          # local dir or HF dataset id
+    n_samples: 500                     # per class (safe / harmful)
+    text_col: "prompt"
+    response_col: "response_0"
+    label_col: "is_response_0_safe"
+  visual_harm:
+    path: "data/visual_harm"           # local dir with images + labels.csv
+    n_samples: 200
+    image_col: "image_path"
+    label_col: "label"                 # 0=safe 1=harmful
+    prompt_template: "Describe what you see in this image."
+
+analysis:
+  n_pls_components: 5
+  n_safety_layers: 5                   # top-k layers by linear-probe accuracy
+  boundary_threshold: 0.35            # |logit| < threshold → boundary sample
+
+output:
+  dir: "outputs"
+  save_states: true                    # cache .npy arrays to disk
