@@ -29,7 +29,7 @@ def load_visual_harm(
     -------
     images  : list of PIL.Image
     prompts : list of str (same prompt for every image)
-    labels  : np.ndarray of int, 1=harmful, 0=safe
+    labels  : np.ndarray of int, 0=harmful, 1=safe
     """
     root = Path(data_path)
     csv_path = root / "labels.csv"
@@ -44,8 +44,8 @@ def load_visual_harm(
     rng = np.random.default_rng(seed)
 
     # Balance if both classes present; otherwise take what we have
-    safe_idx = df[df[label_col] == 0].index.tolist()
-    harm_idx = df[df[label_col] == 1].index.tolist()
+    safe_idx = df[df[label_col] == 1].index.tolist()
+    harm_idx = df[df[label_col] == 0].index.tolist()
 
     if safe_idx and harm_idx:
         n = min(n_samples, len(safe_idx), len(harm_idx))
@@ -67,5 +67,5 @@ def load_visual_harm(
         valid_labels.append(int(row[label_col]))
 
     labels = np.array(valid_labels)
-    print(f"[VisualHarm] Loaded {(labels==0).sum()} safe + {(labels==1).sum()} harmful images")
+    print(f"[VisualHarm] Loaded {(labels==1).sum()} safe + {(labels==0).sum()} harmful images")
     return images, prompts, labels

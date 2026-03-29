@@ -205,8 +205,8 @@ def main():
 
         s = result.stats.copy()
         if img_scores is not None and img_labels is not None:
-            harm_img = img_scores[img_labels == 1]
-            safe_img = img_scores[img_labels == 0]
+            harm_img = img_scores[img_labels == 0]
+            safe_img = img_scores[img_labels == 1]
             s["img_harm_mean"] = float(harm_img.mean()) if len(harm_img) else float("nan")
             s["img_safe_mean"] = float(safe_img.mean()) if len(safe_img) else float("nan")
         summary_stats[layer_idx] = s

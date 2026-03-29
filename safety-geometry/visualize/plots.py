@@ -77,8 +77,8 @@ def plot_projection(
     sns.kdeplot(t_harm, ax=ax, color=COLORS["text_harm"], fill=True, alpha=0.35, label=f"Text harmful (n={len(t_harm)})")
 
     if image_scores is not None:
-        i_harm = image_scores[image_labels == 1] if image_labels is not None else image_scores
-        i_safe_mask = (image_labels == 0) if image_labels is not None else np.zeros(len(image_scores), bool)
+        i_harm = image_scores[image_labels == 0] if image_labels is not None else image_scores
+        i_safe_mask = (image_labels == 1) if image_labels is not None else np.zeros(len(image_scores), bool)
         i_safe = image_scores[i_safe_mask]
 
         if len(i_harm) > 1:
@@ -96,7 +96,7 @@ def plot_projection(
     # ---- Right panel: strip/swarm for images only ----
     ax2 = axes[1]
     if image_scores is not None and image_labels is not None:
-        for lbl, name, color in [(1, "img_harm", COLORS["img_harm"]), (0, "img_safe", COLORS["img_safe"])]:
+        for lbl, name, color in [(0, "img_harm", COLORS["img_harm"]), (1, "img_safe", COLORS["img_safe"])]:
             s = image_scores[image_labels == lbl]
             y = np.random.uniform(-0.2, 0.2, size=len(s))
             ax2.scatter(s, y, color=color, alpha=0.5, s=20, label=name)
@@ -142,8 +142,8 @@ def plot_boundary_analysis(
     _strip(text_scores, text_labels, 1, COLORS["text_safe"], "text_safe")
     _strip(text_scores, text_labels, 0, COLORS["text_harm"], "text_harm")
     if image_scores is not None and image_labels is not None:
-        _strip(image_scores, image_labels, 0, COLORS["img_safe"], "img_safe")
-        _strip(image_scores, image_labels, 1, COLORS["img_harm"], "img_harm")
+        _strip(image_scores, image_labels, 1, COLORS["img_safe"], "img_safe")
+        _strip(image_scores, image_labels, 0, COLORS["img_harm"], "img_harm")
 
     ax.axvline(0, color="black", linestyle=":", linewidth=1.5)
     ax.axvspan(-threshold, threshold, alpha=0.05, color="gray", label="Boundary region")
