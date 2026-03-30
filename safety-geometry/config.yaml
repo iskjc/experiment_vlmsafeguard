@@ -4,7 +4,7 @@ model:
   dtype: "float16"
 
 extraction:
-  pooling: "last"           # "last" (last token) | "mean" (all tokens)
+  pooling: "mean"           # "last" (last token) | "mean" (all tokens)
   batch_size: 4             # LLaVA-1.5-7b needs ~14GB VRAM; reduce if OOM
   layers: null              # null = all 33 layers (0=embed, 1-32=transformer)
 
