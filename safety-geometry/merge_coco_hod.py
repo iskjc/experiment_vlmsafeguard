@@ -81,15 +81,22 @@ def main():
     parser.add_argument("--hod-cache", default="outputs/cache", help="Existing HoD cache dir")
     parser.add_argument("--n-coco-samples", type=int, default=360, help="Number of COCO images to sample")
     parser.add_argument("--output-cache", default="outputs/cache_merged", help="Output cache directory")
+    parser.add_argument("--pooling", choices=["last", "mean"], default=None,
+                        help="Override pooling strategy (default: use config.yaml)")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    
+
+    # Override pooling if specified
+    if args.pooling:
+        cfg["extraction"]["pooling"] = args.pooling
 
     # ------------------------------------------------------------------ #
     # Load model
     # ------------------------------------------------------------------ #
     print("\n" + "=" * 60)
-    print("Loading model for hidden state extraction...")
+    print(f"Loading model for hidden state extraction (pooling={cfg['extraction']['pooling']})...")
     print("=" * 60)
     model, processor = load_model(
         cfg["model"]["name"],
