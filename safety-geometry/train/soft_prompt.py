@@ -122,7 +122,7 @@ class SoftPromptWrapper(nn.Module):
         self,
         model: nn.Module,
         processor,
-        n_soft_tokens: int = 8,
+        n_soft_tokens: int = 16,
         target_layers: list[int] = [13, 14, 15, 16],
         primary_layer: int = 15,
         use_adapter: bool = False,
@@ -474,11 +474,23 @@ class SoftPromptWrapper(nn.Module):
                 new_labels_list.append(torch.cat([l_before, l_img, l_after]))
 
         # Stack batch (all should have same length: T - 1 + n_patches)
-        inputs_embeds = torch.stack(new_embeds_list, dim=0)
+        # Pad to same length
+        max_len = max(e.shape[0] for e in new_embeds_list)
+        inputs_embeds = torch.stack([
+            F.pad(e, (0, 0, 0, max_len - e.shape[0]))
+            for e in new_embeds_list
+        ], dim=0)
+
         if new_mask_list:
-            attention_mask = torch.stack(new_mask_list, dim=0)
+            attention_mask = torch.stack([
+                F.pad(m, (0, max_len - m.shape[0]), value=0)
+                for m in new_mask_list
+            ], dim=0)
         if new_labels_list:
-            labels = torch.stack(new_labels_list, dim=0)
+            labels = torch.stack([
+                F.pad(m, (0, max_len - m.shape[0]), value=0)
+                for m in new_mask_list
+            ], dim=0)
 
         return inputs_embeds, attention_mask, labels
 
@@ -492,9 +504,15 @@ class SoftPromptWrapper(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         pixel_values: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
+        compute_lm_loss: bool = False,
     ):
         """
         Forward pass with soft prompt prepended.
+
+        Args:
+            compute_lm_loss: If True, construct auto-regressive labels from
+                input_ids so that the language model returns a next-token
+                prediction loss (used as a capability-preservation regulariser).
 
         Returns:
             outputs: language model output (logits, loss, …)
@@ -532,10 +550,51 @@ class SoftPromptWrapper(nn.Module):
             B = input_ids.size(0)
 
             # ---- Merge vision features into text embeddings ----
-            inputs_embeds, attention_mask, labels = self._get_merged_embeddings(
+            inputs_embeds, attention_mask, lm_labels = self._get_merged_embeddings(
                 input_ids, pixel_values, attention_mask, labels
             )
             # inputs_embeds: (B, T', D)  T' may be > T if image tokens were expanded
+
+            # ---- Build auto-regressive LM labels if requested ----
+            if compute_lm_loss:
+                # Standard causal LM: predict next token, label = input shifted left
+                # Use the merged input_ids (after image expansion) to build labels.
+                # Since we work with inputs_embeds (not input_ids) at this point,
+                # we reconstruct labels from the embedding indices via nearest-neighbour,
+                # BUT a much simpler approach: use the original input_ids before merge.
+                # The merged sequence has image patches inserted, so we mark those as -100.
+                T_merged = inputs_embeds.shape[1]
+                # Build labels: shift input_ids left by 1 for next-token prediction
+                # For positions we can't map back to token IDs (image patches), use -100
+                lm_labels = torch.full((B, T_merged), -100, device=device, dtype=torch.long)
+                # Map the original text token positions into the merged sequence
+                image_token_index = getattr(self.model.config, 'image_token_index', 32000)
+                for b in range(B):
+                    # Find where text tokens are in the merged sequence
+                    # Original: [text...] <image> [text...]
+                    # Merged:   [text...] [patch1..patchN] [text...]
+                    orig_ids = input_ids[b]  # (T_orig,)
+                    img_pos = (orig_ids == image_token_index).nonzero(as_tuple=True)[0]
+                    if len(img_pos) > 0:
+                        pos = img_pos[0].item()
+                        n_patches = T_merged - orig_ids.shape[0] + 1  # +1 for replaced token
+                        # Before image: positions 0..pos-1 → same in merged
+                        # After image:  positions pos+1.. → shifted by (n_patches - 1) in merged
+                        if pos > 0:
+                            lm_labels[b, :pos] = orig_ids[:pos]
+                        after_len = orig_ids.shape[0] - pos - 1
+                        if after_len > 0:
+                            merged_start = pos + n_patches
+                            lm_labels[b, merged_start:merged_start+after_len] = orig_ids[pos+1:]
+                    else:
+                        # No image token: direct copy
+                        T = min(orig_ids.shape[0], T_merged)
+                        lm_labels[b, :T] = orig_ids[:T]
+                    # Shift left by 1 for next-token prediction
+                    lm_labels[b, :-1] = lm_labels[b, 1:].clone()
+                    lm_labels[b, -1] = -100
+            else:
+                lm_labels = None
 
             # ---- Prepend soft prompt ----
             soft_prompt_expanded = self.soft_prompt.unsqueeze(0).expand(B, -1, -1)  # (B, m, D)
@@ -549,20 +608,20 @@ class SoftPromptWrapper(nn.Module):
                 )
                 attention_mask = torch.cat([soft_mask, attention_mask], dim=1)
 
-            if labels is not None:
+            if lm_labels is not None:
                 label_pad = torch.full(
-                    (B, self.n_soft_tokens), -100, device=device, dtype=labels.dtype
+                    (B, self.n_soft_tokens), -100, device=device, dtype=lm_labels.dtype
                 )
-                labels = torch.cat([label_pad, labels], dim=1)
-            
+                lm_labels = torch.cat([label_pad, lm_labels], dim=1)
+
             # ---- Forward through language model only (vision already merged) ----
             outputs = self._lang_causal(
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
-                labels=labels,
+                labels=lm_labels,
                 output_hidden_states=False,  # we use hooks instead
                 use_cache=False,             # disable KV cache to save VRAM
-                output_attentions=False
+                output_attentions=False,
             )
 
             return outputs, dict(self._hidden_states)
@@ -772,9 +831,10 @@ class SoftPromptTrainer:
         criterion: SafetyAlignmentLoss,
         train_loader: DataLoader,
         val_loader: Optional[DataLoader] = None,
-        lr: float = 1e-5,
+        lr: float = 5e-5,
         output_dir: str = "outputs/soft_prompt",
         pooling: str = "mean",
+        lambda_lm: float = 0.0,
     ):
         self.wrapper = wrapper
         self.criterion = criterion
@@ -783,6 +843,7 @@ class SoftPromptTrainer:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.pooling = pooling
+        self.lambda_lm = lambda_lm
 
         # Collect trainable params
         trainable = [wrapper.soft_prompt]
@@ -838,16 +899,27 @@ class SoftPromptTrainer:
     def _train_epoch(self, epoch: int) -> dict[str, float]:
         agg = {}
         n_batches = 0
+        use_lm = self.lambda_lm > 0
 
         for batch in tqdm(self.train_loader, desc=f"Epoch {epoch}", leave=False):
             images = batch["images"]
             labels = batch["labels"].to(self.wrapper.soft_prompt.device)
             prompts = batch["prompts"]
 
-            outputs, hidden_states = self.wrapper(images=images, text_prompts=prompts)
+            outputs, hidden_states = self.wrapper(
+                images=images, text_prompts=prompts, compute_lm_loss=use_lm,
+            )
             pooled = self.wrapper.get_pooled_hidden(hidden_states, pooling=self.pooling)
 
-            loss, metrics = self.criterion(pooled, labels)
+            align_loss, metrics = self.criterion(pooled, labels)
+
+            # Add LM loss as capability-preservation regulariser
+            if use_lm and outputs.loss is not None:
+                lm_loss = outputs.loss
+                loss = align_loss + self.lambda_lm * lm_loss
+                metrics["lm_loss"] = float(lm_loss.detach())
+            else:
+                loss = align_loss
 
             self.optimizer.zero_grad()
             loss.backward()
@@ -870,9 +942,6 @@ class SoftPromptTrainer:
         for batch in self.val_loader:
             images = batch["images"]
             labels = batch["labels"].to(self.wrapper.soft_prompt.device)
-            
-            print(f"Batch labels: safe={sum(labels==1)}, harm={sum(labels==0)}")
-
             prompts = batch["prompts"]
 
             outputs, hidden_states = self.wrapper(images=images, text_prompts=prompts)
@@ -921,12 +990,16 @@ class SoftPromptTrainer:
         cos = metrics.get(f"L{primary}_cos", 0.0)
         sep = metrics.get(f"L{primary}_sep", 0.0)
         transfer = metrics.get(f"L{primary}_transfer", sep)
+        lm = metrics.get("lm_loss", None)
 
-        print(
+        line = (
             f"  [{phase}] Epoch {epoch:3d} | "
             f"loss={loss:.4f}  cos={cos:+.4f}  sep={sep:.3f}  "
             f"transfer={transfer:.4f}"
         )
+        if lm is not None:
+            line += f"  lm={lm:.4f}"
+        print(line)
 
     def _save_checkpoint(self, epoch, filename):
         state = {
@@ -984,6 +1057,8 @@ def main():
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--lambda-align", type=float, default=1.0)
     parser.add_argument("--lambda-sep", type=float, default=1.0)
+    parser.add_argument("--lambda-lm", type=float, default=0.0,
+                        help="Weight for LM loss regulariser (0 = disabled)")
     parser.add_argument("--margin", type=float, default=0.5)
     parser.add_argument("--pooling", default="mean", choices=["mean", "last"])
     parser.add_argument("--val-split", type=float, default=0.2)
@@ -1162,6 +1237,7 @@ def main():
         lr=args.lr,
         output_dir=args.output_dir,
         pooling=args.pooling,
+        lambda_lm=args.lambda_lm,
     )
 
     if args.eval:
