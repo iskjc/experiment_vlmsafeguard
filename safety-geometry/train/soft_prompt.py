@@ -488,8 +488,8 @@ class SoftPromptWrapper(nn.Module):
             ], dim=0)
         if new_labels_list:
             labels = torch.stack([
-                F.pad(m, (0, max_len - m.shape[0]), value=0)
-                for m in new_mask_list
+                F.pad(l, (0, max_len - l.shape[0]), value=-100)
+                for l in new_labels_list
             ], dim=0)
 
         return inputs_embeds, attention_mask, labels
@@ -551,7 +551,7 @@ class SoftPromptWrapper(nn.Module):
 
             # ---- Merge vision features into text embeddings ----
             inputs_embeds, attention_mask, lm_labels = self._get_merged_embeddings(
-                input_ids, pixel_values, attention_mask, labels
+                input_ids, pixel_values, attention_mask, None  # labels here is safety labels (0/1), NOT LM labels
             )
             # inputs_embeds: (B, T', D)  T' may be > T if image tokens were expanded
 
@@ -835,6 +835,7 @@ class SoftPromptTrainer:
         output_dir: str = "outputs/soft_prompt",
         pooling: str = "mean",
         lambda_lm: float = 0.0,
+        grad_accum_steps: int = 1,
     ):
         self.wrapper = wrapper
         self.criterion = criterion
@@ -844,6 +845,7 @@ class SoftPromptTrainer:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.pooling = pooling
         self.lambda_lm = lambda_lm
+        self.grad_accum_steps = grad_accum_steps
 
         # Collect trainable params
         trainable = [wrapper.soft_prompt]
@@ -900,8 +902,10 @@ class SoftPromptTrainer:
         agg = {}
         n_batches = 0
         use_lm = self.lambda_lm > 0
+        accum = self.grad_accum_steps
 
-        for batch in tqdm(self.train_loader, desc=f"Epoch {epoch}", leave=False):
+        self.optimizer.zero_grad()
+        for step, batch in enumerate(tqdm(self.train_loader, desc=f"Epoch {epoch}", leave=False)):
             images = batch["images"]
             labels = batch["labels"].to(self.wrapper.soft_prompt.device)
             prompts = batch["prompts"]
@@ -921,10 +925,13 @@ class SoftPromptTrainer:
             else:
                 loss = align_loss
 
-            self.optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_([self.wrapper.soft_prompt], max_norm=1.0)
-            self.optimizer.step()
+            # Gradient accumulation: scale loss, accumulate, step every accum steps
+            (loss / accum).backward()
+            is_last_batch = (step + 1 == len(self.train_loader))
+            if (step + 1) % accum == 0 or is_last_batch:
+                torch.nn.utils.clip_grad_norm_([self.wrapper.soft_prompt], max_norm=1.0)
+                self.optimizer.step()
+                self.optimizer.zero_grad()
 
             for k, v in metrics.items():
                 agg[k] = agg.get(k, 0.0) + v
@@ -1059,6 +1066,8 @@ def main():
     parser.add_argument("--lambda-sep", type=float, default=1.0)
     parser.add_argument("--lambda-lm", type=float, default=0.0,
                         help="Weight for LM loss regulariser (0 = disabled)")
+    parser.add_argument("--grad-accum-steps", type=int, default=1,
+                        help="Gradient accumulation steps (effective_bs = batch_size * grad_accum_steps)")
     parser.add_argument("--margin", type=float, default=0.5)
     parser.add_argument("--pooling", default="mean", choices=["mean", "last"])
     parser.add_argument("--val-split", type=float, default=0.2)
@@ -1238,6 +1247,7 @@ def main():
         output_dir=args.output_dir,
         pooling=args.pooling,
         lambda_lm=args.lambda_lm,
+        grad_accum_steps=args.grad_accum_steps,
     )
 
     if args.eval:

@@ -13,7 +13,7 @@ def gen_merged_labels(
     coco_root: str,
     hod_root: str = "data/HOD",
     output_csv: str = "data/visual_harm/labels.csv",
-    n_coco: int = 360,
+    n_coco: int = 2000,
     seed: int = 42,
 ):
     """

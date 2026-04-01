@@ -2,15 +2,15 @@
 Merge COCO safe images with HoD harmful images, extract hidden states, and recompute cosine similarity.
 
 This bridges the gap:
-  - HoD = 360 harmful images (already extracted)
-  - COCO = ~360 safe images (new, to extract)
+  - HoD = 2000 harmful images (already extracted)
+  - COCO = ~2000 safe images (new, to extract)
   - Merged = balanced dataset for cross-modal cosine similarity analysis
 
 Usage:
     python merge_coco_hod.py \\
         --coco-root /path/to/COCO2014/val2014 \\
         --hod-cache outputs/cache \\
-        --n-coco-samples 360 \\
+        --n-coco-samples 2000 \\
         --output-cache outputs/cache_merged
 
 Then run cosine similarity on merged cache:

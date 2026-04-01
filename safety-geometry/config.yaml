@@ -1,7 +1,7 @@
 model:
-  name: "llava-hf/llava-1.5-7b-hf"
+  name: "llava-1.5-7-hf" 
   device: "cuda"
-  dtype: "float16"
+  dtype: "bfloat16"
 
 extraction:
   pooling: "mean"           # "last" (last token) | "mean" (all tokens)
@@ -11,13 +11,13 @@ extraction:
 data:
   pku_saferlhf:
     path: "data/pku_saferlhf"
-    n_samples: 500          # per class
+    n_samples: 1000          # per class
     text_col: "prompt"
     response_col: "response_0"
     label_col: "is_response_0_safe"
   visual_harm:
     path: "data/visual_harm"
-    n_samples: 200
+    n_samples: 1920
     image_col: "image_path"
     label_col: "label"      # 1=safe, 0=harmful
     # question shown to the model alongside each image
