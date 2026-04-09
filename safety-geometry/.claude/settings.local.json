@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find \"/d/SRJ_program/program&practice/experiments/safety-geometry\" -type f \\\\\\( -name \"*.yaml\" -o -name \"*.json\" -o -name \"*.txt\" \\\\\\))"
+    ]
+  }
+}

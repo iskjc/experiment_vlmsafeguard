@@ -2,7 +2,11 @@
   "permissions": {
     "allow": [
       "Bash(ls \"D:/SRJ_program/program&practice/experiments/\")",
-      "Bash(find \"D:/SRJ_program/program&practice/experiments/safety-geometry\" -type f)"
+      "Bash(find \"D:/SRJ_program/program&practice/experiments/safety-geometry\" -type f)",
+      "Bash(ls \"D:\\\\SRJ_program\\\\program&practice\\\\experiments\\\\new_experiments\")",
+      "Bash(ls \"D:\\\\SRJ_program\\\\program&practice\\\\experiments\\\\create_data\")",
+      "Bash(python /tmp/check_model_structure.py)",
+      "Read(//d/SRJ_program/program/&practice/experiments/**)"
     ]
   }
 }
