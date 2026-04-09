@@ -81,6 +81,9 @@ def load_vsc(jsonl_path: str) -> tuple[
         for line in f:
             obj = json.loads(line.strip())
             cat = obj.get("category", "unknown")
+            if not all(k in obj for k in ("safe_description", "harmful_description",
+                                          "safe_image_path", "harmful_image_path")):
+                continue  # skip incomplete pairs to keep indices aligned
             safe_texts_by_cat[cat].append(obj["safe_description"])
             harmful_texts_by_cat[cat].append(obj["harmful_description"])
             safe_imgs_by_cat[cat].append(obj["safe_image_path"])
@@ -333,10 +336,12 @@ def compute_per_category_cosine(
                             set(img_safe_by_cat.keys()) & set(img_harmful_by_cat.keys()))
 
     shared_layers = sorted(
-        set(text_safe_by_cat[all_categories[0]].keys()) &
-        set(text_harmful_by_cat[all_categories[0]].keys()) &
-        set(img_safe_by_cat[all_categories[0]].keys()) &
-        set(img_harmful_by_cat[all_categories[0]].keys())
+        set.intersection(
+            *[set(text_safe_by_cat[c].keys()) for c in all_categories],
+            *[set(text_harmful_by_cat[c].keys()) for c in all_categories],
+            *[set(img_safe_by_cat[c].keys()) for c in all_categories],
+            *[set(img_harmful_by_cat[c].keys()) for c in all_categories],
+        )
     )
 
     results = {}
@@ -485,16 +490,13 @@ def main():
 
     for cat in all_categories:
         print(f"\n[{cat}] Extracting text hidden states ...")
-        del img_safe_flat, img_harmful_flat
-        gc.collect()
-
         text_safe_by_cat[cat]    = extractor.extract_texts(safe_texts_by_cat[cat])
         text_harmful_by_cat[cat] = extractor.extract_texts(harmful_texts_by_cat[cat])
-
         gc.collect()
         torch.cuda.empty_cache()
 
-        img_safe_flat, img_harmful_flat = _load_image_states(img_npz)
+    # Reload image states after text extraction loop (freed GPU mem above)
+    img_safe_flat, img_harmful_flat = _load_image_states(img_npz)
 
     # ── Partition image states by category ──
     img_safe_by_cat: dict[str, dict[int, np.ndarray]] = {}

@@ -66,7 +66,7 @@ CONDITION_STYLES = {
 # Data loading (same as logit_lens.py)
 # ---------------------------------------------------------------------------
 
-def load_dataset(captions_jsonl: str, vscbench_dir: str, n_samples: int, question: str = "Describe this image."):
+def load_dataset(captions_jsonl: str, vscbench_dir: str, n_samples: int, question: str = "Describe this image in detail."):
     with open(captions_jsonl, "r") as f:
         captions = [json.loads(l) for l in f if l.strip()]
 
@@ -92,7 +92,8 @@ def load_dataset(captions_jsonl: str, vscbench_dir: str, n_samples: int, questio
             p = root / rec[path_field]
             if p.exists():
                 try:
-                    dataset[key].append({"text": question, "image": Image.open(p).convert("RGB")})
+                    img_text = f"{question}\n{instruction}" if key == "image_harmful" else question
+                    dataset[key].append({"text": img_text, "image": Image.open(p).convert("RGB")})
                 except Exception as e:
                     print(f"[!] {p}: {e}")
 
@@ -173,10 +174,10 @@ def decompose_norms(hidden_states_by_layer, safety_directions):
         h_perp = H - h_safety         # (N, D)
 
         results[layer] = {
-            "total":  np.linalg.norm(H, axis=1).mean(),
-            "safety": projections.mean(),
-            "perp":   np.linalg.norm(h_perp, axis=1).mean(),
-            "proj_signed": projections.mean(),  # signed: positive = toward safe
+            "total":       np.linalg.norm(H, axis=1).mean(),
+            "safety":      np.abs(projections).mean(),  # projection magnitude
+            "perp":        np.linalg.norm(h_perp, axis=1).mean(),
+            "proj_signed": projections.mean(),           # signed: positive = toward safe
         }
     return results
 

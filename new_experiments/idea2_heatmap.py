@@ -164,8 +164,6 @@ def run_heatmaps_all_layers(
         for cat in categories:
             h_emb = harm_by_cat[cat][layer]
             s_emb = safe_by_cat[cat][layer]
-            diff = h_emb.mean(axis=0) - s_emb.mean(axis=0)
-            diff_norm = float(np.linalg.norm(diff))
             dirs[cat] = mean_diff_direction(h_emb, s_emb)
         directions_by_layer[layer] = dirs
 
