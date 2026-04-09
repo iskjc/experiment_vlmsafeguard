@@ -228,9 +228,13 @@ class LLaVAProber:
             if cfg_idx is not None:
                 img_mask = (input_ids == cfg_idx)
 
-        if img_mask.sum().item() > 0:
-            vec = hs[img_mask].mean(dim=0)
-        else:
+        hs_seq_len = hs.shape[0]
+        ids_list = input_ids.tolist()
+        try:
+            img_pos   = ids_list.index(self.IMAGE_TOKEN_INDEX)
+            expansion = hs_seq_len - len(ids_list)       # num_image_tokens - 1
+            vec = hs[img_pos : img_pos + expansion + 1].mean(dim=0)
+        except ValueError:
             print("[!] No image tokens found, falling back to full-sequence mean.")
             vec = hs.mean(dim=0)
 

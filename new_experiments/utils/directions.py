@@ -68,8 +68,6 @@ def safety_subspace(harmful: np.ndarray, safe: np.ndarray, k: int | None = None
     diff_matrix = harmful[:n] - safe[:n]           # (N, D)
     diff_matrix -= diff_matrix.mean(axis=0)        # center
 
-    U, sv, _ = svd(diff_matrix, full_matrices=False)
-    # U is (N, N), sv is (min(N,D),), Vt is (min(N,D), D)
     # We want the right singular vectors (Vt rows) as the subspace basis
     _, sv, Vt = svd(diff_matrix, full_matrices=False)
 
