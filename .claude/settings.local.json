@@ -6,7 +6,9 @@
       "Bash(ls \"D:\\\\SRJ_program\\\\program&practice\\\\experiments\\\\new_experiments\")",
       "Bash(ls \"D:\\\\SRJ_program\\\\program&practice\\\\experiments\\\\create_data\")",
       "Bash(python /tmp/check_model_structure.py)",
-      "Read(//d/SRJ_program/program/&practice/experiments/**)"
+      "Read(//d/SRJ_program/program/&practice/experiments/**)",
+      "Bash(pip show:*)",
+      "Bash(pip index:*)"
     ]
   }
 }

@@ -7,27 +7,22 @@ Per-category, per-layer cosine similarity between:
 
 Output: heatmap matrix (category × layer) showing text vs image direction alignment.
 
-Dataset: vscbench_captions.jsonl (produced by create_data/vscbench_caption.py)
-  {
-    "pair_id":             "discrimination/0_0",
-    "category":            "discrimination",
-    "safe_image_path":     "discrimination/safe_discrimination_0_0.png",
-    "harmful_image_path":  "discrimination/unsafe_discrimination_0_0.png",
-    "safe_description":    "...",
-    "harmful_description": "..."
-  }
-
-Text extraction: raw text description, mean or last token pooling, on GPU.
-Image extraction: "Describe this image." prompt, image token (576 tokens) mean pooling, on GPU.
-Direction: mean(safe) - mean(harmful), L2-normalised, computed per category per layer.
+Multi-model support via utils.model_registry.
 
 Usage:
-    python new_experiments/vsc_semantic_cosine.py
+    python vsc_semantic_cosine.py \
+        --model_path /path/to/model \
+        --captions_jsonl /path/to/captions.jsonl \
+        --image_dir /path/to/images \
+        --output_dir ./results/vsc_semantic_cosine \
+        [--family llava-next]
 """
 
 from __future__ import annotations
 
+import argparse
 import json
+from collections import defaultdict
 from pathlib import Path
 from typing import Optional
 
@@ -38,25 +33,8 @@ import numpy as np
 import torch
 from PIL import Image
 from tqdm import tqdm
-from transformers import LlavaNextForConditionalGeneration, LlavaNextProcessor
 
-# ---------------------------------------------------------------------------
-# Config — fill these in
-# ---------------------------------------------------------------------------
-LLAVA_MODEL_PATH  = ""   # e.g. "/model/llava-v1.6-vicuna-7b-hf"
-VSC_CAPTIONS_JSONL = ""  # e.g. "outputs/vscbench_captions.jsonl"
-VSC_IMAGE_DIR      = ""  # e.g. "/data/vscbench/vscbench_image_centric_images"
-OUTPUT_DIR         = ""  # e.g. "./results/vsc_semantic_cosine"
-
-# Which layers to compute (None = all 33 layers including embedding layer 0)
-LAYERS: Optional[list[int]] = None  # e.g. list(range(1, 33))
-
-# LLaVA-NeXT image token placeholder in input_ids (before model expansion)
-# Default -200 works for llava-hf models; override if needed.
-IMAGE_TOKEN_INDEX = -200
-
-
-BATCH_SIZE = 1   # increase if VRAM allows; LLaVA-NeXT is memory-heavy
+from utils.model_registry import load_vlm, VLMWrapper
 
 
 # ---------------------------------------------------------------------------
@@ -66,12 +44,6 @@ BATCH_SIZE = 1   # increase if VRAM allows; LLaVA-NeXT is memory-heavy
 def load_vsc(jsonl_path: str) -> tuple[
     dict[str, list[str]], dict[str, list[str]], dict[str, list[str]], dict[str, list[str]]
 ]:
-    """
-    Returns data grouped by category:
-        {category: [safe_texts]}, {category: [harmful_texts]},
-        {category: [safe_img_paths]}, {category: [harmful_img_paths]}
-    """
-    from collections import defaultdict
     safe_texts_by_cat = defaultdict(list)
     harmful_texts_by_cat = defaultdict(list)
     safe_imgs_by_cat = defaultdict(list)
@@ -83,7 +55,7 @@ def load_vsc(jsonl_path: str) -> tuple[
             cat = obj.get("category", "unknown")
             if not all(k in obj for k in ("safe_description", "harmful_description",
                                           "safe_image_path", "harmful_image_path")):
-                continue  # skip incomplete pairs to keep indices aligned
+                continue
             safe_texts_by_cat[cat].append(obj["safe_description"])
             harmful_texts_by_cat[cat].append(obj["harmful_description"])
             safe_imgs_by_cat[cat].append(obj["safe_image_path"])
@@ -91,7 +63,6 @@ def load_vsc(jsonl_path: str) -> tuple[
 
     total = sum(len(v) for v in safe_texts_by_cat.values())
     print(f"[Data] Loaded {total} pairs from {jsonl_path}")
-    print(f"[Data] Categories: {sorted(safe_texts_by_cat.keys())}")
     for cat in sorted(safe_texts_by_cat.keys()):
         print(f"       {cat}: {len(safe_texts_by_cat[cat])} pairs")
 
@@ -99,173 +70,68 @@ def load_vsc(jsonl_path: str) -> tuple[
 
 
 # ---------------------------------------------------------------------------
-# Hidden state extraction
+# Hidden state extraction (model-agnostic)
 # ---------------------------------------------------------------------------
 
 class VSCExtractor:
-    """
-    Extracts per-layer hidden states for VSCBench text descriptions and images.
-    """
+    """Extracts per-layer hidden states using VLMWrapper."""
 
-    QUERY_SUFFIX = "Please describe this image in detail."   # appended to both modalities
+    QUERY_SUFFIX = "Please describe this image in detail."
 
-    def __init__(
-        self,
-        model_path: str,
-        device: str = "cuda",
-        layers: Optional[list[int]] = None,
-        image_token_index: int = IMAGE_TOKEN_INDEX,
-    ):
-        self.device = device if torch.cuda.is_available() else "cpu"
+    def __init__(self, vlm: VLMWrapper, layers: Optional[list[int]] = None):
+        self.vlm = vlm
         self.layers = layers
-        self.image_token_index = image_token_index
-
-        print(f"[Extractor] Loading LLaVA-NeXT from {model_path} ...")
-        self.processor = LlavaNextProcessor.from_pretrained(model_path)
-        self.model = LlavaNextForConditionalGeneration.from_pretrained(
-            model_path,
-            torch_dtype=torch.float16,
-            device_map=self.device,
-            low_cpu_mem_usage=True,
-        ).eval()
-
-        self._image_prompt_str = self._build_image_prompt()
-        print(f"[Extractor] Ready. image_token_index={image_token_index}")
-
-    # ------------------------------------------------------------------ #
-    # Prompt builders
-    # ------------------------------------------------------------------ #
-
-    def _build_image_prompt(self) -> str:
-        conversation = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image"},
-                    {"type": "text", "text": self.QUERY_SUFFIX},
-                ],
-            }
-        ]
-        return self.processor.apply_chat_template(
-            conversation, add_generation_prompt=True
-        )
-
-    def _build_text_prompt(self, text: str) -> str:
-        # Append QUERY_SUFFIX after description.
-        # Truncation is handled at encode time (max_length=512) so the description
-        # may be cut, but QUERY_SUFFIX tokens at the end are always preserved.
-        conversation = [{"role": "user", "content": f"{text}\n{self.QUERY_SUFFIX}"}]
-        return self.processor.apply_chat_template(
-            conversation, add_generation_prompt=True
-        )
-
-    def _find_query_span(self, input_ids_list: list) -> tuple[int, int]:
-        """
-        Find positions of QUERY_SUFFIX tokens in input_ids.
-        Returns (start, end) slice covering those tokens.
-        """
-        query_ids = self.processor.tokenizer.encode(
-            self.QUERY_SUFFIX, add_special_tokens=False
-        )
-        n = len(query_ids)
-        for i in range(len(input_ids_list) - n, -1, -1):
-            if input_ids_list[i: i + n] == query_ids:
-                return i, i + n
-        # Fallback: last 3 tokens before end
-        return max(0, len(input_ids_list) - 3), len(input_ids_list)
-
-    def _find_query_span_image(self, input_ids_list: list, hs_seq_len: int) -> tuple[int, int]:
-        """
-        Same as _find_query_span but corrects for the image token expansion.
-        input_ids has one token (-200) for <image>; hidden_states has num_image_tokens
-        tokens there. All query positions after the image token must be offset.
-        """
-        start, end = self._find_query_span(input_ids_list)
-        try:
-            img_pos = input_ids_list.index(self.image_token_index)
-            expansion = hs_seq_len - len(input_ids_list)  # e.g. 576 - 1 = 575
-            if start > img_pos:
-                start += expansion
-                end += expansion
-        except ValueError:
-            pass
-        return start, end
-
-    # ------------------------------------------------------------------ #
-    # Core forward
-    # ------------------------------------------------------------------ #
 
     def _layer_indices(self, n_layers: int) -> list[int]:
         if self.layers is None:
             return list(range(n_layers))
         return [i for i in self.layers if i < n_layers]
 
-    # ------------------------------------------------------------------ #
-    # Text extraction
-    # ------------------------------------------------------------------ #
+    def _find_query_span(self, input_ids_list: list) -> tuple[int, int]:
+        query_ids = self.vlm.tokenizer.encode(
+            self.QUERY_SUFFIX, add_special_tokens=False
+        )
+        n = len(query_ids)
+        for i in range(len(input_ids_list) - n, -1, -1):
+            if input_ids_list[i: i + n] == query_ids:
+                return i, i + n
+        return max(0, len(input_ids_list) - 3), len(input_ids_list)
 
     def extract_texts(self, texts: list[str]) -> dict[int, np.ndarray]:
-        """
-        Returns {layer: (N, D)}.
-        Prompt: USER: {description}\nPlease describe this image in detail. ASSISTANT:
-        Extracts mean hidden state of QUERY_SUFFIX tokens.
-
-        To guarantee QUERY_SUFFIX is never truncated, we first tokenize the
-        description alone, truncate it so that the full prompt fits in max_length,
-        then rebuild the prompt with the truncated description.
-        """
+        """Returns {layer: (N, D)}. Extracts mean hidden state of QUERY_SUFFIX tokens."""
         collected: dict[int, list[np.ndarray]] = {}
 
-        # Pre-compute how many tokens QUERY_SUFFIX + template overhead consume
         query_token_len = len(
-            self.processor.tokenizer.encode(self.QUERY_SUFFIX, add_special_tokens=False)
+            self.vlm.tokenizer.encode(self.QUERY_SUFFIX, add_special_tokens=False)
         )
-        MAX_LENGTH   = 512
-        # ~30 tokens of overhead for chat template (system/role tokens, etc.)
+        MAX_LENGTH = 512
         TEMPLATE_OVERHEAD = 30
         desc_max_len = MAX_LENGTH - query_token_len - TEMPLATE_OVERHEAD
 
         for text in tqdm(texts, desc="Extracting [text]"):
-            # Truncate description so the full prompt will fit within MAX_LENGTH
-            desc_ids = self.processor.tokenizer.encode(
+            desc_ids = self.vlm.tokenizer.encode(
                 text, add_special_tokens=False, truncation=True, max_length=desc_max_len
             )
-            truncated_text = self.processor.tokenizer.decode(desc_ids, skip_special_tokens=True)
+            truncated_text = self.vlm.tokenizer.decode(desc_ids, skip_special_tokens=True)
 
-            prompt_str = self._build_text_prompt(truncated_text)
-            inputs = self.processor.tokenizer(
-                prompt_str,
-                return_tensors="pt",
-                truncation=False,   # already truncated above; no further cut needed
-                add_special_tokens=False,
-            ).to(self.device)
+            user_text = f"{truncated_text}\n{self.QUERY_SUFFIX}"
+            hidden_states, inputs = self.vlm.forward_hidden(None, user_text)
 
             ids = inputs["input_ids"][0].tolist()
             start, end = self._find_query_span(ids)
 
-            with torch.no_grad():
-                outputs = self.model(**inputs, output_hidden_states=True, return_dict=True)
-
-            layer_idxs = self._layer_indices(len(outputs.hidden_states))
+            layer_idxs = self._layer_indices(len(hidden_states))
             for i in layer_idxs:
-                hs = outputs.hidden_states[i][0].float()  # (T, D) on GPU
+                hs = hidden_states[i][0].float()
                 vec = hs[start:end].mean(dim=0)
                 collected.setdefault(i, []).append(vec.cpu().numpy())
 
-            del outputs
+            del hidden_states
 
         return {k: np.stack(v, axis=0) for k, v in collected.items()}
 
-    # ------------------------------------------------------------------ #
-    # Image extraction — image tokens only
-    # ------------------------------------------------------------------ #
-
     def extract_images(self, image_paths: list[str], image_root: Path) -> dict[int, np.ndarray]:
-        """
-        Returns {layer: (N, D)}.
-        Prompt: USER: <image>\nPlease describe this image in detail. ASSISTANT:
-        Extracts mean hidden state of QUERY_SUFFIX tokens.
-        """
+        """Returns {layer: (N, D)}. Extracts mean hidden state of QUERY_SUFFIX tokens."""
         collected: dict[int, list[np.ndarray]] = {}
 
         for img_path in tqdm(image_paths, desc="Extracting [image]"):
@@ -276,27 +142,23 @@ class VSCExtractor:
                 print(f"  [!] Cannot open {full_path}: {e} — using blank image")
                 image = Image.new("RGB", (336, 336))
 
-            inputs = self.processor(
-                images=image,
-                text=self._image_prompt_str,
-                return_tensors="pt",
-            ).to(self.device, torch.float16)
+            hidden_states, inputs = self.vlm.forward_hidden(image, self.QUERY_SUFFIX)
 
-            ids = inputs["input_ids"][0].tolist()
+            ids = inputs["input_ids"][0].cpu().tolist()
+            hs_seq_len = hidden_states[0].shape[1]
 
-            with torch.no_grad():
-                outputs = self.model(**inputs, output_hidden_states=True, return_dict=True)
+            start, end = self._find_query_span(ids)
+            # Correct for image token expansion
+            start = self.vlm.offset_for_image_expansion(start, ids, hs_seq_len)
+            end = self.vlm.offset_for_image_expansion(end, ids, hs_seq_len)
 
-            hs_seq_len = outputs.hidden_states[0].shape[1]
-            start, end = self._find_query_span_image(ids, hs_seq_len)
-
-            layer_idxs = self._layer_indices(len(outputs.hidden_states))
+            layer_idxs = self._layer_indices(len(hidden_states))
             for i in layer_idxs:
-                hs = outputs.hidden_states[i][0].float()  # (T_expanded, D) on GPU
+                hs = hidden_states[i][0].float()
                 vec = hs[start:end].mean(dim=0)
                 collected.setdefault(i, []).append(vec.cpu().numpy())
 
-            del outputs
+            del hidden_states
 
         return {k: np.stack(v, axis=0) for k, v in collected.items()}
 
@@ -306,7 +168,6 @@ class VSCExtractor:
 # ---------------------------------------------------------------------------
 
 def mean_diff_direction(safe: np.ndarray, harmful: np.ndarray) -> np.ndarray:
-    """(mean_safe - mean_harmful), L2-normalised. safe/harmful: (N, D)"""
     d = safe.mean(axis=0) - harmful.mean(axis=0)
     norm = np.linalg.norm(d)
     if norm < 1e-12:
@@ -319,19 +180,9 @@ def mean_diff_direction(safe: np.ndarray, harmful: np.ndarray) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 def compute_per_category_cosine(
-    text_safe_by_cat: dict[str, dict[int, np.ndarray]],
-    text_harmful_by_cat: dict[str, dict[int, np.ndarray]],
-    img_safe_by_cat: dict[str, dict[int, np.ndarray]],
-    img_harmful_by_cat: dict[str, dict[int, np.ndarray]],
-) -> tuple[dict[str, dict[int, float]], np.ndarray, list[str]]:
-    """
-    Compute per-category, per-layer text vs image cosine similarity.
-
-    Returns:
-        results: {category: {layer: cos_sim}}
-        matrix: (n_cat, n_layer) array for heatmap
-        cat_labels: sorted category names
-    """
+    text_safe_by_cat, text_harmful_by_cat,
+    img_safe_by_cat, img_harmful_by_cat,
+):
     all_categories = sorted(set(text_safe_by_cat.keys()) & set(text_harmful_by_cat.keys()) &
                             set(img_safe_by_cat.keys()) & set(img_harmful_by_cat.keys()))
 
@@ -356,9 +207,6 @@ def compute_per_category_cosine(
             cos = float(np.clip(np.dot(t_dir, i_dir), -1.0, 1.0))
             results[cat][layer] = cos
             matrix[cat_idx, layer_idx] = cos
-            tag = "ALIGNED" if cos > 0.5 else ("ORTHO" if abs(cos) < 0.2 else "PARTIAL")
-            if layer_idx % 5 == 0:  # print every 5th layer to avoid spam
-                print(f"  [{cat:20s}] Layer {layer:3d} | cos={cos:+.4f}  {tag}")
 
     return results, matrix, all_categories
 
@@ -367,16 +215,7 @@ def compute_per_category_cosine(
 # Plot
 # ---------------------------------------------------------------------------
 
-def plot_category_heatmap(matrix: np.ndarray, categories: list[str], layers: list[int], save_path: Path):
-    """
-    Plot category × layer heatmap of text vs image cosine similarity.
-
-    Parameters
-    ----------
-    matrix : (n_cat, n_layer) array
-    categories : category names
-    layers : layer indices
-    """
+def plot_category_heatmap(matrix, categories, layers, save_path):
     fig, ax = plt.subplots(figsize=(14, max(4, len(categories) * 0.3)))
     im = ax.imshow(matrix, aspect="auto", cmap="RdBu_r", vmin=-1, vmax=1)
 
@@ -388,15 +227,13 @@ def plot_category_heatmap(matrix: np.ndarray, categories: list[str], layers: lis
     ax.set_ylabel("Category", fontsize=11)
     ax.set_title("VSCBench Cross-Modal Refusal Direction Alignment\n(Text vs Image per Category per Layer)", fontsize=12)
 
-    # Add colorbar
     cbar = plt.colorbar(im, ax=ax)
     cbar.set_label("Cosine similarity", fontsize=10)
 
-    # Add text annotations for each cell
     for i in range(len(categories)):
         for j in range(len(layers)):
-            text = ax.text(j, i, f"{matrix[i, j]:.2f}", ha="center", va="center",
-                          color="white" if abs(matrix[i, j]) > 0.5 else "black", fontsize=7)
+            ax.text(j, i, f"{matrix[i, j]:.2f}", ha="center", va="center",
+                    color="white" if abs(matrix[i, j]) > 0.5 else "black", fontsize=7)
 
     plt.tight_layout()
     fig.savefig(save_path, dpi=150, bbox_inches="tight")
@@ -404,22 +241,11 @@ def plot_category_heatmap(matrix: np.ndarray, categories: list[str], layers: lis
     print(f"[Plot] Saved to {save_path}")
 
 
-def print_report(results: dict[str, dict[int, float]]):
-    print("\n" + "=" * 60)
-    print("VSCBench: Text vs Image Refusal Direction per Category")
-    print("=" * 60)
-    for cat in sorted(results.keys()):
-        cos_vals = list(results[cat].values())
-        mean_cos = np.mean(cos_vals)
-        print(f"[{cat:20s}] Mean cos = {mean_cos:+.4f}  Std = {np.std(cos_vals):.4f}")
-    print("=" * 60)
-
-
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-def _load_image_states(npz_path: Path) -> tuple[dict[int, np.ndarray], dict[int, np.ndarray]]:
+def _load_image_states(npz_path):
     data = np.load(npz_path)
     img_safe, img_harmful = {}, {}
     for key in data.files:
@@ -427,80 +253,74 @@ def _load_image_states(npz_path: Path) -> tuple[dict[int, np.ndarray], dict[int,
             img_safe[int(key[len("img_safe_layer"):])] = data[key]
         elif key.startswith("img_harmful_layer"):
             img_harmful[int(key[len("img_harmful_layer"):])] = data[key]
-    print(f"[Cache] Loaded image hidden states from {npz_path} "
-          f"({len(img_safe)} layers)")
+    print(f"[Cache] Loaded image hidden states from {npz_path} ({len(img_safe)} layers)")
     return img_safe, img_harmful
 
 
 def main():
-    assert LLAVA_MODEL_PATH,   "Fill in LLAVA_MODEL_PATH"
-    assert VSC_CAPTIONS_JSONL, "Fill in VSC_CAPTIONS_JSONL"
-    assert VSC_IMAGE_DIR,      "Fill in VSC_IMAGE_DIR"
-    assert OUTPUT_DIR,         "Fill in OUTPUT_DIR"
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model_path", type=str, required=True)
+    parser.add_argument("--family", type=str, default=None)
+    parser.add_argument("--captions_jsonl", type=str, required=True)
+    parser.add_argument("--image_dir", type=str, required=True)
+    parser.add_argument("--output_dir", type=str, required=True)
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--layers", type=str, default=None,
+                        help="Comma-separated layer indices, e.g. '1,5,10,20'. Default: all layers.")
+    args = parser.parse_args()
 
-    out = Path(OUTPUT_DIR)
+    out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
-    image_root = Path(VSC_IMAGE_DIR)
+    image_root = Path(args.image_dir)
     img_npz = out / "img_hidden_states.npz"
 
-    safe_texts_by_cat, harmful_texts_by_cat, safe_imgs_by_cat, harmful_imgs_by_cat = load_vsc(VSC_CAPTIONS_JSONL)
+    layers = None
+    if args.layers:
+        layers = [int(x) for x in args.layers.split(",")]
 
-    # Flatten for image extraction (all categories mixed)
+    safe_texts_by_cat, harmful_texts_by_cat, safe_imgs_by_cat, harmful_imgs_by_cat = load_vsc(args.captions_jsonl)
     all_categories = sorted(safe_texts_by_cat.keys())
-    safe_texts_flat = [t for cat in all_categories for t in safe_texts_by_cat[cat]]
-    harmful_texts_flat = [t for cat in all_categories for t in harmful_texts_by_cat[cat]]
+
     safe_imgs_flat = [p for cat in all_categories for p in safe_imgs_by_cat[cat]]
     harmful_imgs_flat = [p for cat in all_categories for p in harmful_imgs_by_cat[cat]]
 
-    extractor = VSCExtractor(
-        LLAVA_MODEL_PATH,
-        layers=LAYERS,
-        image_token_index=IMAGE_TOKEN_INDEX,
-    )
+    vlm = load_vlm(args.model_path, family=args.family, device=args.device)
+    extractor = VSCExtractor(vlm, layers=layers)
 
-    # ── Image hidden states: extract once, cache to disk ──
+    # Image hidden states: extract once, cache to disk
     if img_npz.exists():
         print(f"\n[Image] Cache found at {img_npz}, skipping extraction.")
         img_safe_flat, img_harmful_flat = _load_image_states(img_npz)
     else:
-        print("\n[Image] Extracting safe image hidden states (image tokens, mean pool) ...")
-        img_safe_flat    = extractor.extract_images(safe_imgs_flat,    image_root)
-        print("[Image] Extracting harmful image hidden states (image tokens, mean pool) ...")
+        print("\n[Image] Extracting safe image hidden states ...")
+        img_safe_flat = extractor.extract_images(safe_imgs_flat, image_root)
+        print("[Image] Extracting harmful image hidden states ...")
         img_harmful_flat = extractor.extract_images(harmful_imgs_flat, image_root)
         np.savez(
             img_npz,
-            **{f"img_safe_layer{k}":    v for k, v in img_safe_flat.items()},
+            **{f"img_safe_layer{k}": v for k, v in img_safe_flat.items()},
             **{f"img_harmful_layer{k}": v for k, v in img_harmful_flat.items()},
         )
         print(f"[Saved] {img_npz}")
 
-    import json as _json
     import gc
 
-    def _save_text_states(states: dict[int, np.ndarray], path: Path):
-        np.savez(path, **{f"layer{k}": v for k, v in states.items()})
-
-    def _load_text_states(path: Path) -> dict[int, np.ndarray]:
-        data = np.load(path)
-        return {int(k[len("layer"):]): data[k] for k in data.files}
-
-    # ── Extract text hidden states per category ──
-    text_safe_by_cat: dict[str, dict[int, np.ndarray]] = {}
-    text_harmful_by_cat: dict[str, dict[int, np.ndarray]] = {}
+    # Extract text hidden states per category
+    text_safe_by_cat = {}
+    text_harmful_by_cat = {}
 
     for cat in all_categories:
         print(f"\n[{cat}] Extracting text hidden states ...")
-        text_safe_by_cat[cat]    = extractor.extract_texts(safe_texts_by_cat[cat])
+        text_safe_by_cat[cat] = extractor.extract_texts(safe_texts_by_cat[cat])
         text_harmful_by_cat[cat] = extractor.extract_texts(harmful_texts_by_cat[cat])
         gc.collect()
         torch.cuda.empty_cache()
 
-    # Reload image states after text extraction loop (freed GPU mem above)
     img_safe_flat, img_harmful_flat = _load_image_states(img_npz)
 
-    # ── Partition image states by category ──
-    img_safe_by_cat: dict[str, dict[int, np.ndarray]] = {}
-    img_harmful_by_cat: dict[str, dict[int, np.ndarray]] = {}
+    # Partition image states by category
+    img_safe_by_cat = {}
+    img_harmful_by_cat = {}
 
     start_idx = 0
     for cat in all_categories:
@@ -520,19 +340,26 @@ def main():
         }
         start_idx += n
 
-    # ── Compute per-category cosine similarity ──
     results, matrix, cat_labels = compute_per_category_cosine(
         text_safe_by_cat, text_harmful_by_cat,
         img_safe_by_cat, img_harmful_by_cat
     )
 
-    print_report(results)
+    # Print report
+    print("\n" + "=" * 60)
+    print("VSCBench: Text vs Image Refusal Direction per Category")
+    print("=" * 60)
+    for cat in sorted(results.keys()):
+        cos_vals = list(results[cat].values())
+        mean_cos = np.mean(cos_vals)
+        print(f"[{cat:20s}] Mean cos = {mean_cos:+.4f}  Std = {np.std(cos_vals):.4f}")
+    print("=" * 60)
 
-    layers = sorted(list(results[all_categories[0]].keys()))
-    plot_category_heatmap(matrix, cat_labels, layers, out / "vsc_heatmap.png")
+    shared_layers = sorted(list(results[all_categories[0]].keys()))
+    plot_category_heatmap(matrix, cat_labels, shared_layers, out / "vsc_heatmap.png")
 
     with open(out / "cosine_results.json", "w") as f:
-        _json.dump({cat: {str(layer): cos for layer, cos in results[cat].items()}
+        json.dump({cat: {str(layer): cos for layer, cos in results[cat].items()}
                    for cat in results.keys()}, f, indent=2)
     print(f"[Saved] cosine_results.json -> {out}")
 

@@ -1,65 +1,78 @@
 """
-Hidden-state extraction from LLaVA-v1.6-7b-vicuna.
- 
-Image direction probe  : hidden state of the "Describe" token
-Text direction probe   : mean of last N tokens before "ASSISTANT:" marker
-                         (the system-end tokens after user query)
- 
+Hidden-state extraction for VLMs (multi-model support).
+
+Supports: LLaVA-Next, Qwen2-VL, Qwen2.5-VL, InternVL3.
+Uses utils.model_registry for unified model loading.
+
+Image direction probe  : hidden state of query tokens or image tokens
+Text direction probe   : mean of last N tokens before generation marker
+
 Both extracted from configurable transformer layer (default: layer 16).
 """
- 
+
 from __future__ import annotations
 from pathlib import Path
 from typing import List
- 
+
 import numpy as np
 import torch
 from PIL import Image
-from transformers import LlavaNextForConditionalGeneration, LlavaNextProcessor
- 
- 
+
+from utils.model_registry import VLMWrapper, load_vlm
+
+
 class LLaVAProber:
     """
-    Extracts per-sample hidden states from LLaVA-v1.6-vicuna.
- 
+    Extracts per-sample hidden states from VLMs.
+
     Parameters
     ----------
     model_path : str
-        Local path or HF ID of llava-hf/llava-v1.6-vicuna-7b-hf
+        Local path or HF ID of any supported VLM.
     layer : int
         Which transformer layer to probe (0-indexed; default 16).
     device : str
         'cuda' or 'cpu'
+    family : str, optional
+        Model family override. Auto-detected from model_path if None.
+    vlm : VLMWrapper, optional
+        Pass an already-loaded VLMWrapper to share across scripts.
     """
- 
+
     QUERY_SUFFIX = "describe this."
- 
-    def __init__(self, model_path: str, layer: int = 16, device: str = "cuda"):
-        self.device = device if torch.cuda.is_available() else "cpu"
+
+    def __init__(
+        self,
+        model_path: str = "",
+        layer: int = 16,
+        device: str = "cuda",
+        family: str | None = None,
+        vlm: VLMWrapper | None = None,
+    ):
         self.layer = layer
- 
-        print(f"[LLaVAProber] Loading model from {model_path} ...")
-        self.processor = LlavaNextProcessor.from_pretrained(model_path)
-        self.model = LlavaNextForConditionalGeneration.from_pretrained(
-            model_path,
-            torch_dtype=torch.float16,
-            device_map=self.device,
-            low_cpu_mem_usage=True,
-        )
-        self.model.eval()
- 
+
+        if vlm is not None:
+            self.vlm = vlm
+        else:
+            self.vlm = load_vlm(model_path, family=family, device=device)
+
+        self.device = self.vlm.device
+        self.model = self.vlm.model
+        self.processor = self.vlm.processor
+        self.IMAGE_TOKEN_INDEX = self.vlm.get_image_token_id()
+
         print(f"[LLaVAProber] Ready. probe_layer={layer}")
- 
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
- 
+
     def _find_query_span(self, input_ids_list: list) -> tuple[int, int]:
         """
         Find start/end positions of QUERY_SUFFIX ("describe this.") tokens in input_ids.
         Returns (start, end). Falls back to last 3 tokens before ASSISTANT:.
         """
-        query_ids = self.processor.tokenizer.encode(
+        query_ids = self.vlm.tokenizer.encode(
             self.QUERY_SUFFIX, add_special_tokens=False
         )
         n = len(query_ids)
@@ -76,32 +89,21 @@ class LLaVAProber:
         Returns position, or len(input_ids)-1 as fallback.
         """
         full = input_ids.tolist() if isinstance(input_ids, torch.Tensor) else input_ids
- 
+
         # Try multiple candidates
         for surface in ["ASSISTANT:", " ASSISTANT:", "ASSISTANT"]:
-            ids = self.processor.tokenizer.encode(surface, add_special_tokens=False)
+            ids = self.vlm.tokenizer.encode(surface, add_special_tokens=False)
             for i in range(len(full) - len(ids), -1, -1):
                 if full[i : i + len(ids)] == ids:
                     return i
- 
+
         # Fallback
         return max(len(full) - 1, 0)
- 
+
     def _build_image_prompt(self) -> str:
-        """Build chat-template string: USER: <image> describe this. ASSISTANT:"""
-        conversation = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image"},
-                    {"type": "text", "text": self.QUERY_SUFFIX},
-                ],
-            }
-        ]
-        return self.processor.apply_chat_template(
-            conversation, add_generation_prompt=True
-        )
- 
+        """Build chat-template string with image placeholder."""
+        return self.vlm.build_prompt(self.QUERY_SUFFIX, has_image=True)
+
     @torch.no_grad()
     def _forward_hidden(self, inputs: dict) -> torch.Tensor:
         """
@@ -115,24 +117,20 @@ class LLaVAProber:
         )
         hs = outputs.hidden_states[self.layer]  # (batch, seq_len, hidden_dim)
         return hs[0].cpu().float()  # (seq_len, hidden_dim)
- 
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
- 
+
     @torch.no_grad()
     def encode_image(self, image: Image.Image) -> np.ndarray:
         """
-        Extract mean hidden state over the query text tokens ("Describe this image.")
-        in the image input sequence — paper-aligned approach.
+        Extract mean hidden state over the query text tokens
+        in the image input sequence.
         Returns: (hidden_dim,) L2-normalised array.
         """
         prompt_str = self._build_image_prompt()
-        inputs = self.processor(
-            images=image,
-            text=prompt_str,
-            return_tensors="pt",
-        ).to(self.device, torch.float16)
+        inputs = self.vlm.tokenize(prompt_str, image)
 
         ids = inputs["input_ids"][0].cpu().tolist()
         outputs = self.model(**inputs, output_hidden_states=True, return_dict=True)
@@ -150,25 +148,17 @@ class LLaVAProber:
         vec = hs[start:end].mean(dim=0).numpy()
 
         return vec / (np.linalg.norm(vec) + 1e-8)
- 
+
     @torch.no_grad()
     def encode_text(self, text: str) -> np.ndarray:
         """
-        Prompt: USER: {text} describe this. ASSISTANT:
-        Extracts mean hidden state of "describe this." tokens.
+        Extracts mean hidden state of "describe this." tokens from text-only input.
         Returns: (hidden_dim,) L2-normalised array.
         """
-        prompt_str = (
-            "A chat between a curious user and an artificial intelligence assistant. "
-            "The assistant gives helpful, detailed, and polite answers to the user's questions. "
-            f"USER: {text} {self.QUERY_SUFFIX} ASSISTANT:"
+        prompt_str = self.vlm.build_prompt(
+            f"{text} {self.QUERY_SUFFIX}", has_image=False
         )
-        inputs = self.processor.tokenizer(
-            prompt_str,
-            return_tensors="pt",
-            truncation=True,
-            max_length=512,
-        ).to(self.device)
+        inputs = self.vlm.tokenize(prompt_str, image=None)
 
         hs = self._forward_hidden(inputs)          # (T, D) on CPU
         ids = inputs["input_ids"][0].tolist()
@@ -176,11 +166,11 @@ class LLaVAProber:
         vec = hs[start:end].mean(dim=0).numpy()
 
         return vec / (np.linalg.norm(vec) + 1e-8)
- 
+
     # ------------------------------------------------------------------
     # Batch helpers
     # ------------------------------------------------------------------
- 
+
     def encode_images(self, images: List[Image.Image]) -> np.ndarray:
         """Returns (N, hidden_dim) array. Uses 'Describe' token position."""
         return np.stack([self.encode_image(img) for img in images], axis=0)
@@ -197,44 +187,29 @@ class LLaVAProber:
         return self.encode_images(images)
 
     # ------------------------------------------------------------------
-    # Image token mean pool (paper-aligned approach)
+    # Image token mean pool
     # ------------------------------------------------------------------
-
-    IMAGE_TOKEN_INDEX = -200   # input_ids placeholder for <image> in llava-hf models
 
     @torch.no_grad()
     def encode_image_token_pool(self, image: Image.Image) -> np.ndarray:
         """
         Extract mean hidden state over image token positions only (no prompt tokens).
-        More aligned with Cross-Modal paper approach than 'Describe' token.
         Returns: (hidden_dim,) L2-normalised array.
         """
         prompt_str = self._build_image_prompt()
-        inputs = self.processor(
-            images=image,
-            text=prompt_str,
-            return_tensors="pt",
-        ).to(self.device, torch.float16)
+        inputs = self.vlm.tokenize(prompt_str, image)
 
         outputs = self.model(**inputs, output_hidden_states=True, return_dict=True)
         hs = outputs.hidden_states[self.layer][0].float()   # (T, D)
 
         input_ids = inputs["input_ids"][0]
-        img_mask = (input_ids == self.IMAGE_TOKEN_INDEX)
-
-        # Fallback: try model config image token index
-        if img_mask.sum().item() == 0:
-            cfg_idx = getattr(getattr(self.model, "config", None), "image_token_index", None)
-            if cfg_idx is not None:
-                img_mask = (input_ids == cfg_idx)
-
-        hs_seq_len = hs.shape[0]
         ids_list = input_ids.tolist()
-        try:
-            img_pos   = ids_list.index(self.IMAGE_TOKEN_INDEX)
-            expansion = hs_seq_len - len(ids_list)       # num_image_tokens - 1
-            vec = hs[img_pos : img_pos + expansion + 1].mean(dim=0)
-        except ValueError:
+        hs_seq_len = hs.shape[0]
+
+        img_start, img_end = self.vlm.find_image_token_span(ids_list, hs_seq_len)
+        if img_end > img_start:
+            vec = hs[img_start:img_end].mean(dim=0)
+        else:
             print("[!] No image tokens found, falling back to full-sequence mean.")
             vec = hs.mean(dim=0)
 
@@ -252,7 +227,7 @@ class LLaVAProber:
                 img = Image.new("RGB", (336, 336))
             vecs.append(self.encode_image_token_pool(img))
         return np.stack(vecs, axis=0)
- 
+
     def encode_texts(self, texts: List[str]) -> np.ndarray:
         """Returns (N, hidden_dim) array."""
         return np.stack([self.encode_text(t) for t in texts], axis=0)
@@ -265,21 +240,12 @@ class LLaVAProber:
     def encode_text_all_layers(self, text: str) -> dict:
         """
         Returns {layer_idx: (hidden_dim,)} for all transformer layers.
-        Probes the last user token before ASSISTANT: — this position attends
-        to all preceding context and carries the strongest content signal.
+        Probes the last user token before generation marker.
         """
-        # Manually build Vicuna-style prompt to avoid apply_chat_template issues
-        prompt_str = (
-            "A chat between a curious user and an artificial intelligence assistant. "
-            "The assistant gives helpful, detailed, and polite answers to the user's questions. "
-            f"USER: {text} {self.QUERY_SUFFIX} ASSISTANT:"
+        prompt_str = self.vlm.build_prompt(
+            f"{text} {self.QUERY_SUFFIX}", has_image=False
         )
-        inputs = self.processor.tokenizer(
-            prompt_str,
-            return_tensors="pt",
-            truncation=True,
-            max_length=512,
-        ).to(self.device)
+        inputs = self.vlm.tokenize(prompt_str, image=None)
 
         ids = inputs["input_ids"][0].tolist()
         asst_pos = self._find_assistant_start(ids)
@@ -297,14 +263,10 @@ class LLaVAProber:
     def encode_image_token_pool_all_layers(self, image: Image.Image) -> dict:
         """
         Returns {layer_idx: (hidden_dim,)} for all transformer layers.
-        Probes the last token before ASSISTANT: in the expanded sequence.
+        Probes the last token before generation marker in the expanded sequence.
         """
         prompt_str = self._build_image_prompt()
-        inputs = self.processor(
-            images=image,
-            text=prompt_str,
-            return_tensors="pt",
-        ).to(self.device, torch.float16)
+        inputs = self.vlm.tokenize(prompt_str, image)
 
         ids = inputs["input_ids"][0].cpu().tolist()
 
@@ -313,14 +275,8 @@ class LLaVAProber:
         hs_seq_len = outputs.hidden_states[0].shape[1]
         asst_pos = self._find_assistant_start(ids)
         probe_pos = max(asst_pos - 1, 0)
-        # Correct for image token expansion (-200 → num_image_tokens)
-        try:
-            img_pos = ids.index(self.IMAGE_TOKEN_INDEX)
-            expansion = hs_seq_len - len(ids)
-            if probe_pos > img_pos:
-                probe_pos += expansion
-        except ValueError:
-            pass
+        # Correct for image token expansion
+        probe_pos = self.vlm.offset_for_image_expansion(probe_pos, ids, hs_seq_len)
         probe_pos = min(probe_pos, hs_seq_len - 1)
 
         result = {}
